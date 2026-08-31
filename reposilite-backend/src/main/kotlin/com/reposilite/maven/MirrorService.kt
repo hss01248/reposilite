@@ -24,6 +24,7 @@ import com.reposilite.maven.application.MirroredRepositorySettings
 import com.reposilite.shared.ErrorResponse
 import com.reposilite.shared.internalServer
 import com.reposilite.status.FailureFacade
+import com.reposilite.storage.api.DocumentInfo
 import com.reposilite.storage.api.FileDetails
 import com.reposilite.storage.api.Location
 import com.reposilite.token.AccessTokenIdentifier
@@ -40,6 +41,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorCompletionService
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
 
 internal const val NO_EXTENSION_MARKER = "<none>"
 
@@ -87,10 +89,45 @@ internal class MirrorService(
             gav = gav,
             accessToken = accessToken,
             hosts = hosts,
-            parallel = repository.parallelMetadataLookup && gav.getSimpleName() == METADATA_FILE,
+            mode = parallelLookupMode(repository, gav),
         ) { (host, config, client) ->
             client.head("${host.removeSuffix("/")}/$gav", config.authorization, config.connectTimeout, config.readTimeout)
         }
+
+    fun findRemoteDocument(
+        repository: Repository,
+        gav: Location,
+        accessToken: AccessTokenIdentifier? = null,
+        hosts: List<MirrorHost> = repository.mirrorHosts,
+    ): MirrorResolution<Pair<DocumentInfo, InputStream>> {
+        val detailsResolution = findRemoteDetails(repository, gav, accessToken, hosts)
+        return when (detailsResolution) {
+            is MirrorResolution.Resolved -> {
+                val details = detailsResolution.value
+                if (details !is DocumentInfo) {
+                    return MirrorResolution.Failed(internalServer("Expected file details for '$gav', but got $details"))
+                }
+                val mirror = detailsResolution.mirror
+                mirror.client
+                    .get("${mirror.host.removeSuffix("/")}/$gav", mirror.configuration.authorization, mirror.configuration.connectTimeout, mirror.configuration.readTimeout)
+                    .flatMap { stream ->
+                        when {
+                            mirror.configuration.store -> storeFile(repository, gav, stream).map { details to it }
+                            else -> ok(details to stream)
+                        }
+                    }
+                    .let { result ->
+                        when {
+                            result.isOk -> MirrorResolution.Resolved(result.get(), mirror)
+                            else -> MirrorResolution.Failed(result.error)
+                        }
+                    }
+            }
+            is MirrorResolution.Failed -> MirrorResolution.Failed(detailsResolution.error)
+            MirrorResolution.NotFound -> MirrorResolution.NotFound
+            MirrorResolution.NoEligibleHosts -> MirrorResolution.NoEligibleHosts
+        }
+    }
 
     fun findRemoteFile(
         repository: Repository,
@@ -173,7 +210,7 @@ internal class MirrorService(
         gav: Location,
         accessToken: AccessTokenIdentifier?,
         hosts: List<MirrorHost>,
-        parallel: Boolean = false,
+        mode: ParallelLookupMode = ParallelLookupMode.SERIAL,
         fetch: (MirrorHost) -> Result<V, ErrorResponse>,
     ): MirrorResolution<V> {
         val eligibleHosts = hosts
@@ -184,24 +221,101 @@ internal class MirrorService(
                     { reason ->
                         logger.debug("MirrorService | Cannot request '$gav' from remote repository '${repository.name}' (reason: illegal $reason)")
                         false
-                    }
+                    },
                 )
             }
         if (eligibleHosts.isEmpty()) {
             return MirrorResolution.NoEligibleHosts
         }
 
-        if (parallel && eligibleHosts.size > 1 && eligibleHosts.none { it.client is RepositoryLoopbackClient }) {
-            val completionService = ExecutorCompletionService<Pair<MirrorHost, Result<V, ErrorResponse>>>(ioService)
-            val tasks = eligibleHosts.map { host -> completionService.submit { host to fetch(host) } }
-            return try {
-                resolve((1..tasks.size).asSequence().map { completionService.take().get() })
-            } finally {
-                tasks.forEach { it.cancel(true) }
+        if (mode != ParallelLookupMode.SERIAL && eligibleHosts.size > 1 && eligibleHosts.none { it.client is RepositoryLoopbackClient }) {
+            if (mode == ParallelLookupMode.FIRST_OK) {
+                return parallelFirstOk(eligibleHosts, fetch)
+            }
+            if (mode == ParallelLookupMode.PRIORITY_RACE) {
+                return parallelPriorityRace(eligibleHosts, repository.metadataRaceWindowMs, fetch)
             }
         }
 
         return resolve(eligibleHosts.asSequence().map { it to fetch(it) })
+    }
+
+    private fun <V> parallelFirstOk(
+        eligibleHosts: List<MirrorHost>,
+        fetch: (MirrorHost) -> Result<V, ErrorResponse>,
+    ): MirrorResolution<V> {
+        val completionService = ExecutorCompletionService<Pair<MirrorHost, Result<V, ErrorResponse>>>(ioService)
+        val tasks = eligibleHosts.map { host -> completionService.submit { host to fetch(host) } }
+        var remaining = tasks.size
+        var lastUpstreamError: ErrorResponse? = null
+        return try {
+            while (remaining > 0) {
+                val future = completionService.take()
+                remaining--
+                val (host, result) = future.get()
+                when {
+                    result.isOk -> {
+                        cancelTasks(tasks)
+                        return MirrorResolution.Resolved(result.get(), host)
+                    }
+                    // HttpRemoteClient maps upstream 404 to 406; treat every miss as "keep racing"
+                    // instead of aborting — otherwise a fast empty mirror cancels the real hit.
+                    else -> if (result.error.status != 404) {
+                        lastUpstreamError = result.error
+                    }
+                }
+            }
+            lastUpstreamError?.let { MirrorResolution.Failed(it) } ?: MirrorResolution.NotFound
+        } finally {
+            cancelTasks(tasks)
+        }
+    }
+
+    private fun <V> parallelPriorityRace(
+        eligibleHosts: List<MirrorHost>,
+        raceWindowMs: Int,
+        fetch: (MirrorHost) -> Result<V, ErrorResponse>,
+    ): MirrorResolution<V> {
+        val indexedHosts = eligibleHosts.withIndex().toList()
+        val completionService = ExecutorCompletionService<Triple<Int, MirrorHost, Result<V, ErrorResponse>>>(ioService)
+        val tasks = indexedHosts.map { (index, host) ->
+            completionService.submit { Triple(index, host, fetch(host)) }
+        }
+        val okResponses = mutableListOf<Pair<Int, Pair<MirrorHost, V>>>()
+        var remaining = tasks.size
+        var lastUpstreamError: ErrorResponse? = null
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(raceWindowMs.toLong())
+        return try {
+            while (remaining > 0) {
+                val waitMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime()).coerceAtLeast(0)
+                if (okResponses.isNotEmpty() && waitMs <= 0) {
+                    break
+                }
+                val future = if (waitMs <= 0) {
+                    completionService.poll() ?: break
+                } else {
+                    completionService.poll(waitMs, TimeUnit.MILLISECONDS) ?: break
+                }
+                remaining--
+                val (index, host, result) = future.get()
+                when {
+                    result.isOk -> okResponses.add(index to (host to result.get()))
+                    result.error.status != 404 -> lastUpstreamError = result.error
+                }
+            }
+            if (okResponses.isNotEmpty()) {
+                val (winnerHost, value) = okResponses.minBy { it.first }.second
+                cancelTasks(tasks)
+                return MirrorResolution.Resolved(value, winnerHost)
+            }
+            lastUpstreamError?.let { MirrorResolution.Failed(it) } ?: MirrorResolution.NotFound
+        } finally {
+            cancelTasks(tasks)
+        }
+    }
+
+    private fun cancelTasks(tasks: List<java.util.concurrent.Future<*>>) {
+        tasks.forEach { if (!it.isDone) it.cancel(true) }
     }
 
     private fun <V> resolve(results: Sequence<Pair<MirrorHost, Result<V, ErrorResponse>>>): MirrorResolution<V> {

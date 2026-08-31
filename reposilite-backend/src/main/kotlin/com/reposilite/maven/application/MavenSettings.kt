@@ -39,7 +39,25 @@ data class MavenSettings(
         RepositorySettings("releases"),
         RepositorySettings("snapshots"),
         RepositorySettings("private", visibility = PRIVATE),
+    ),
+    @Min(1)
+    @get:Doc(
+        title = "Miss short-circuit threshold",
+        description = "After this many final 404 responses for the same artifact path, skip upstream mirror probes and return 404 immediately. (Default: 9)",
     )
+    val missShortCircuitThreshold: Int = 9,
+    @Min(0)
+    @get:Doc(
+        title = "Miss stats dedupe seconds",
+        description = "Within this window: (1) repeated final 404s for the same path count once in SQLite, and (2) an in-memory negative cache skips further upstream mirror probes. (Default: 60)",
+    )
+    val missStatsDedupeSeconds: Int = 60,
+    @Min(1)
+    @get:Doc(
+        title = "Miss stats retention days",
+        description = "Remove miss records below the short-circuit threshold when older than this many days. (Default: 7)",
+    )
+    val missStatsRetentionDays: Int = 7,
 ) : SharedSettings
 
 @Doc(title = "Maven Repository", description = "Settings for a given repository.")
@@ -83,6 +101,9 @@ data class RepositorySettings(
     val proxied: List<MirroredRepositorySettings> = listOf(),
     @get:Doc(title = "Parallel metadata lookup", description = "Probe mirrors concurrently for Maven metadata and route later requests through the first matching mirror. Requires the resolution cache to be enabled.")
     val parallelMetadataLookup: Boolean = false,
+    @Min(0)
+    @get:Doc(title = "Metadata race window", description = "When resolving artifact-level Maven metadata, wait up to this many milliseconds for mirror responses before choosing the highest-priority mirror that returned 200. Only applies when parallel metadata lookup is enabled.")
+    val metadataRaceWindowMs: Int = 500,
 ) : SharedSettings
 
 @Doc(title = "Mirrored Maven Repository", description = "Configuration of proxied host")
@@ -100,7 +121,7 @@ data class MirroredRepositorySettings(
     val allowedExtensions: List<String> = listOf(".jar", ".war", ".aar", ".pom", ".xml", ".module", ".md5", ".sha1", ".sha256", ".sha512", ".asc"),
     @Min(0)
     @get:Doc(title = "Connect Timeout", description = "How long Reposilite can wait for establishing the connection with a remote host. (In seconds)")
-    val connectTimeout: Int = 3,
+    val connectTimeout: Int = 8,
     @Min(0)
     @get:Doc(title = "Read Timeout", description = "How long Reposilite can read data from remote proxy. (In seconds)")
     val readTimeout: Int = 15,

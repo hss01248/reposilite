@@ -26,6 +26,7 @@ import { property } from '../helpers/vue-extensions'
 const ConsoleView = defineAsyncComponent(() => import('../components/console/ConsoleView.vue'))
 const DashboardView = defineAsyncComponent(() => import('../components/dashboard/DashboardView.vue'))
 const StatisticsView = defineAsyncComponent(() => import('../components/dashboard/StatisticsView.vue'))
+const MissStatsView = defineAsyncComponent(() => import('../components/dashboard/MissStatsView.vue'))
 const DiagnosticsView = defineAsyncComponent(() => import('../components/dashboard/DiagnosticsView.vue'))
 const TokensView = defineAsyncComponent(() => import('../components/tokens/TokensView.vue'))
 const SettingsView = defineAsyncComponent(() => import('../components/settings/SettingsView.vue'))
@@ -38,6 +39,7 @@ const listOfTabs = [
   { name: 'Overview', manager: false },
   { name: 'Dashboard', manager: true },
   { name: 'Statistics', manager: true },
+  { name: '404 Miss', manager: true },
   { name: 'Diagnostics', manager: true },
   { name: 'Tokens', manager: true },
   { name: 'Console', manager: true },
@@ -136,6 +138,15 @@ const selectHomepage = () =>
               v-if="selectedTab == 'Statistics'"
               @goto="selectedTab = $event"
             />
+          </TabPanel>
+          <TabPanel
+            v-show="isManager"
+            id="main-panel-miss-stats"
+            role="tabpanel"
+            aria-labelledby="main-tab-404-miss"
+            :val="'404 Miss'"
+          >
+            <MissStatsView v-if="selectedTab == '404 Miss'" />
           </TabPanel>
           <TabPanel
             v-show="isManager"

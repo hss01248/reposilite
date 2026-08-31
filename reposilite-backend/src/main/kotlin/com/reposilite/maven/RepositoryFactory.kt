@@ -37,17 +37,32 @@ internal class RepositoryFactory(
     private val failureFacade: FailureFacade,
     private val storageFacade: StorageFacade,
     private val repositoriesNames: Collection<String>,
+    private val resolutionOriginStore: ResolutionOriginStore? = null,
+    private val proxyHitStatsStore: ProxyHitStatsStore? = null,
 ) {
 
     private val repositoriesDirectory = Paths.get("repositories")
 
-    fun createRepository(repositoryName: String, configuration: RepositorySettings): Repository =
-        Repository(
-            name = repositoryName.ifEmpty { UUID.randomUUID().toString() },
+    fun createRepository(repositoryName: String, configuration: RepositorySettings): Repository {
+        val name = repositoryName.ifEmpty { UUID.randomUUID().toString() }
+        val hitCounts = proxyHitStatsStore?.getCounts(name) ?: emptyMap()
+        val mirrorHosts = configuration.proxied
+            .mapNotNull { createMirroredHostConfiguration(it) }
+            .sortedByDescending { hitCounts[it.host] ?: 0 }
+
+        if (mirrorHosts.isNotEmpty() && hitCounts.isNotEmpty()) {
+            val preview = mirrorHosts.take(5).joinToString { host ->
+                "${host.host}(${hitCounts[host.host] ?: 0})"
+            }
+            journalist.logger.info("Repository '$name' | proxied order by pom-hit: $preview")
+        }
+
+        return Repository(
+            name = name,
             visibility = configuration.visibility,
             redeployment = configuration.redeployment,
             preserveSnapshots = configuration.preserveSnapshots,
-            mirrorHosts = configuration.proxied.mapNotNull { createMirroredHostConfiguration(it) },
+            mirrorHosts = mirrorHosts,
             storageProvider =
                 storageFacade
                     .createStorageProvider(
@@ -61,8 +76,11 @@ internal class RepositoryFactory(
             storagePolicy = configuration.storagePolicy,
             metadataMaxAgeInSeconds = configuration.metadataMaxAge,
             parallelMetadataLookup = configuration.parallelMetadataLookup,
+            metadataRaceWindowMs = configuration.metadataRaceWindowMs,
             resolutionCacheMaxEntries = configuration.resolutionCacheMaxEntries,
+            resolutionOriginStore = resolutionOriginStore,
         )
+    }
 
     private fun createMirroredHostConfiguration(configurationSource: MirroredRepositorySettings): MirrorHost? {
         val name = configurationSource.reference.trim()

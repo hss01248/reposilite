@@ -141,10 +141,18 @@ internal class RepositoryService(
             .flatMap { securityProvider.canAccessResource(accessToken, it, gav) }
 
     private fun findFile(accessToken: AccessTokenIdentifier?, repository: Repository, gav: Location): Result<Pair<DocumentInfo, InputStream>, ErrorResponse> =
-        findDetails(accessToken, repository, gav)
-            .`is`(DocumentInfo::class.java) { notFound("Requested file is a directory") }
-            .flatMap { details -> findInputStream(repository, gav, accessToken).map { details to it } }
-            .let { extensions.emitEvent(ResolvedFileEvent(accessToken, repository, gav, it)).result }
+        resolutionProvider.resolve(
+            repository = repository,
+            gav = gav,
+            accessToken = accessToken,
+            mirrorFirst = mirrorService.shouldPrioritizeMirrorRepository(repository, gav),
+            tryLocal = {
+                repository.storageProvider.getFileDetails(gav)
+                    .`is`(DocumentInfo::class.java) { notFound("Requested file is a directory") }
+                    .flatMap { details -> repository.storageProvider.getFile(gav).map { details to it } }
+            },
+            tryRemote = { hosts -> mirrorService.findRemoteDocument(repository, gav, accessToken, hosts) },
+        ).let { extensions.emitEvent(ResolvedFileEvent(accessToken, repository, gav, it)).result }
 
     fun findInputStream(lookupRequest: LookupRequest): Result<InputStream, ErrorResponse> =
         resolve(lookupRequest) { repository, gav -> findInputStream(repository, gav, lookupRequest.accessToken) }

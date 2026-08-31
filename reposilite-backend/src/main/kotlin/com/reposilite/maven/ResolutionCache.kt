@@ -20,7 +20,11 @@ import com.reposilite.storage.api.Location
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.LongAdder
 
-internal class ResolutionCache(private val maxEntries: Int) {
+internal class ResolutionCache(
+    private val maxEntries: Int,
+    private val repositoryName: String = "",
+    private val originStore: ResolutionOriginStore? = null,
+) {
 
     private data class Key(val prefix: Location, val authenticated: Boolean)
 
@@ -45,7 +49,8 @@ internal class ResolutionCache(private val maxEntries: Int) {
         val exactPrefix = gav.getParent()
         var prefix = exactPrefix
         while (prefix != Location.empty()) {
-            val entry = entries[Key(prefix, authenticated)]
+            val key = Key(prefix, authenticated)
+            val entry = entries[key]
             if (entry != null) {
                 // Negative is authoritative only at the exact prefix — it says "this metadata file returned 404",
                 // not "every descendant is empty." Local/Remote pins still inherit down (routing decisions).
@@ -56,6 +61,16 @@ internal class ResolutionCache(private val maxEntries: Int) {
                 entry.hitCount.increment()
                 return entry.origin
             }
+
+            // Memory miss → durable Remote pin (if any). Local / MissingMetadata are not persisted.
+            val storedHost = originStore?.findRemote(repositoryName, prefix.toString(), authenticated)
+            if (storedHost != null) {
+                val remote = Origin.Remote(storedHost)
+                putMemory(key, remote)
+                entries[key]?.hitCount?.increment()
+                return remote
+            }
+
             prefix = prefix.getParent()
         }
         return null
@@ -70,12 +85,8 @@ internal class ResolutionCache(private val maxEntries: Int) {
         if (entries[key]?.origin == origin) {
             return
         }
-        // Size check + insert is intentionally not synchronized — maxEntries is a soft cap that may
-        // transiently overshoot under concurrent writes; the next record self-heals via eviction.
-        if (!entries.containsKey(key) && entries.size >= maxEntries) {
-            evictDownTo(maxEntries - 1)
-        }
-        entries[key] = Entry(origin)
+        putMemory(key, origin)
+        persist(prefix, authenticated, origin)
     }
 
     fun invalidate(gav: Location) {
@@ -86,10 +97,12 @@ internal class ResolutionCache(private val maxEntries: Int) {
         }
         entries.remove(Key(prefix, authenticated = true))
         entries.remove(Key(prefix, authenticated = false))
+        originStore?.deletePrefix(repositoryName, prefix.toString())
     }
 
     fun purge() {
         entries.clear()
+        originStore?.deleteRepository(repositoryName)
     }
 
     fun size(): Int =
@@ -102,10 +115,30 @@ internal class ResolutionCache(private val maxEntries: Int) {
             .take(top.coerceAtLeast(0))
             .toList()
 
+    private fun putMemory(key: Key, origin: Origin) {
+        // Size check + insert is intentionally not synchronized — maxEntries is a soft cap that may
+        // transiently overshoot under concurrent writes; the next record self-heals via eviction.
+        if (!entries.containsKey(key) && entries.size >= maxEntries) {
+            evictDownTo(maxEntries - 1)
+        }
+        entries[key] = Entry(origin)
+    }
+
+    private fun persist(prefix: Location, authenticated: Boolean, origin: Origin) {
+        val store = originStore ?: return
+        when (origin) {
+            is Origin.Remote -> store.upsertRemote(repositoryName, prefix.toString(), authenticated, origin.host)
+            // Overwriting a Remote pin with Local / MissingMetadata must drop the durable row,
+            // otherwise a restart would revive a stale host.
+            else -> store.delete(repositoryName, prefix.toString(), authenticated)
+        }
+    }
+
     private fun evictDownTo(targetSize: Int) {
         synchronized(evictionLock) {
             while (entries.size > targetSize) {
                 val victim = entries.entries.minByOrNull { it.value.hitCount.sum() } ?: return
+                // Evict memory only — durable Remote pins remain and can be reloaded on next miss.
                 entries.remove(victim.key, victim.value)
             }
         }

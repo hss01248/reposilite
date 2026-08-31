@@ -17,15 +17,24 @@
 package com.reposilite.maven.application
 
 import com.reposilite.auth.AuthenticationFacade
+import com.reposilite.configuration.shared.SharedConfigurationFacade
 import com.reposilite.frontend.application.FrontendSettings
 import com.reposilite.journalist.Journalist
 import com.reposilite.maven.LatestService
 import com.reposilite.maven.MavenFacade
 import com.reposilite.maven.MetadataService
 import com.reposilite.maven.MirrorService
+import com.reposilite.maven.MissStatsFacade
+import com.reposilite.maven.MissStatsService
+import com.reposilite.maven.MissStatsStore
+import com.reposilite.maven.ProxyHitStatsStore
+import com.reposilite.maven.ResolutionOriginStore
 import com.reposilite.maven.ResolutionProvider
 import com.reposilite.maven.RepositoryProvider
 import com.reposilite.maven.RepositorySecurityProvider
+import com.reposilite.maven.infrastructure.SqlMissStatsStore
+import com.reposilite.maven.infrastructure.SqlProxyHitStatsStore
+import com.reposilite.maven.infrastructure.SqlResolutionOriginStore
 import com.reposilite.plugin.Extensions
 import com.reposilite.plugin.api.PluginComponents
 import com.reposilite.shared.http.RemoteClientProvider
@@ -33,6 +42,7 @@ import com.reposilite.statistics.StatisticsFacade
 import com.reposilite.status.FailureFacade
 import com.reposilite.storage.StorageFacade
 import com.reposilite.token.AccessTokenFacade
+import org.jetbrains.exposed.v1.jdbc.Database
 import panda.std.reactive.Reference
 import java.nio.file.Path
 import java.time.Clock
@@ -52,6 +62,8 @@ internal class MavenComponents(
     private val ioService: ExecutorService,
     private val mavenSettings: Reference<MavenSettings>,
     private val frontendSettings: Reference<FrontendSettings>,
+    private val sharedConfigurationFacade: SharedConfigurationFacade? = null,
+    private val database: Database? = null,
 ) : PluginComponents {
 
     private fun securityProvider(): RepositorySecurityProvider =
@@ -68,13 +80,37 @@ internal class MavenComponents(
             ioService = ioService,
         )
 
+    private val sharedMissStatsStore: MissStatsStore? by lazy {
+        database?.let { SqlMissStatsStore(it) }
+    }
+
+    private val sharedMissStatsService: MissStatsService? by lazy {
+        sharedMissStatsStore?.let { MissStatsService(it, mavenSettings, clock) }
+    }
+
+    private val sharedProxyHitStatsStore: ProxyHitStatsStore? by lazy {
+        database?.let { SqlProxyHitStatsStore(it) }
+    }
+
     private fun resolutionProvider(): ResolutionProvider =
-        ResolutionProvider(journalist)
+        ResolutionProvider(journalist, sharedMissStatsService, sharedProxyHitStatsStore)
+
+    private fun resolutionOriginStore(): ResolutionOriginStore? =
+        database?.let { SqlResolutionOriginStore(it) }
+
+    private fun buildMissStatsFacade(): MissStatsFacade? {
+        val store = sharedMissStatsStore ?: return null
+        val service = sharedMissStatsService ?: return null
+        val shared = sharedConfigurationFacade ?: return null
+        return MissStatsFacade(store, service, mavenSettings, shared)
+    }
 
     private fun repositoryProvider(
         mirrorService: MirrorService = mirrorService(),
         resolutionProvider: ResolutionProvider = resolutionProvider(),
         securityProvider: RepositorySecurityProvider = securityProvider(),
+        resolutionOriginStore: ResolutionOriginStore? = resolutionOriginStore(),
+        proxyHitStatsStore: ProxyHitStatsStore? = sharedProxyHitStatsStore,
     ): RepositoryProvider =
         RepositoryProvider(
             journalist = journalist,
@@ -88,7 +124,9 @@ internal class MavenComponents(
             statisticsFacade = statisticsFacade,
             extensions = extensions,
             repositorySecurityProvider = securityProvider,
-            repositoriesSource = mavenSettings.computed { it.repositories }
+            repositoriesSource = mavenSettings.computed { it.repositories },
+            resolutionOriginStore = resolutionOriginStore,
+            proxyHitStatsStore = proxyHitStatsStore,
         )
 
     private fun latestService(): LatestService =
@@ -107,5 +145,7 @@ internal class MavenComponents(
             metadataService = metadataService,
             latestService = latestService
         )
+
+    fun missStatsFacade(): MissStatsFacade? = buildMissStatsFacade()
 
 }

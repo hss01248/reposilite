@@ -77,20 +77,34 @@ internal class MavenEndpoints(
 
     fun findFile(ctx: Context, identifier: AccessTokenIdentifier?, repository: String, gav: Location): Result<Unit, ErrorResponse> {
         val request = LookupRequest(accessToken = identifier, repository = repository, gav = gav)
-        val allDetails = mavenFacade.findDetails(request)
+        val resolvedFile = mavenFacade.findFile(request)
 
-        return allDetails.flatMap { details ->
+        if (resolvedFile.isOk) {
+            return resolvedFile.map { resolved ->
+                ctx.resultAttachment(
+                    name = resolved.document.name,
+                    contentType = resolved.document.contentType,
+                    contentLength = resolved.document.contentLength,
+                    lastTimeModified = resolved.document.lastModifiedTime,
+                    compressionStrategy = compressionStrategy,
+                    cache = resolved.cachable,
+                    data = resolved.content,
+                )
+            }
+        }
+
+        return mavenFacade.findDetails(request).flatMap { details ->
             when (details) {
                 is DocumentInfo ->
-                    mavenFacade.findData(request).map { data ->
+                    resolvedFile.map { resolved ->
                         ctx.resultAttachment(
-                            name = details.name,
-                            contentType = details.contentType,
-                            contentLength = details.contentLength,
-                            lastTimeModified = details.lastModifiedTime,
+                            name = resolved.document.name,
+                            contentType = resolved.document.contentType,
+                            contentLength = resolved.document.contentLength,
+                            lastTimeModified = resolved.document.lastModifiedTime,
                             compressionStrategy = compressionStrategy,
                             cache = mavenFacade.acceptsCachingOf(request),
-                            data = data,
+                            data = resolved.content,
                         )
                     }
                 is DirectoryInfo -> {
@@ -99,7 +113,7 @@ internal class MavenEndpoints(
                             basePath = frontendFacade.resolveBasePath(ctx.header(frontendFacade.forwardedPrefixHeader.get())),
                             uri = ctx.uri(),
                             authenticatedFiles = mavenFacade.getAvailableFiles(request, details),
-                        )
+                        ),
                     )
                     Unit.asSuccess()
                 }

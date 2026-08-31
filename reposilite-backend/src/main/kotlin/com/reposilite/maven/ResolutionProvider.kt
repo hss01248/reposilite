@@ -27,6 +27,8 @@ import panda.std.Result
 
 internal class ResolutionProvider(
     private val journalist: Journalist,
+    private val missStatsService: MissStatsService? = null,
+    private val proxyHitStatsStore: ProxyHitStatsStore? = null,
 ) : Journalist {
 
     private data class ResolveAttempt<T>(
@@ -52,18 +54,109 @@ internal class ResolutionProvider(
             return notFoundError(notFoundMessage)
         }
 
-        val hosts = (cached as? ResolutionCache.Origin.Remote)
+        val pinnedRemote = cached as? ResolutionCache.Origin.Remote
+
+        // Optional classifiers (-javadoc/-sources/…) without a Remote pin: local only.
+        // No pin usually means Local disk hit for pom, or cold cache — full remirror only
+        // burns Sync time on packages that are rarely published upstream.
+        if (gav.isOptionalClassifierArtifact() && pinnedRemote == null) {
+            logger.debug("Resolution | Optional '$gav' without Remote pin — local only, skipping mirrors")
+            return tryLocal().flatMapErr { notFoundError(notFoundMessage) }
+        }
+
+        val missStats = missStatsService
+        if (gav.shouldTrackMissStats() && missStats != null) {
+            if (missStats.shouldShortCircuit(repository.name, gav, authenticated)) {
+                logger.debug("Resolution | Miss short-circuit for '$gav' — skipping mirrors")
+                return tryLocal().flatMapErr { notFoundError(notFoundMessage) }
+            }
+            return missStats.coalesce(
+                repositoryName = repository.name,
+                gav = gav,
+                authenticated = authenticated,
+                leader = {
+                    resolveWithMirrors(repository, gav, authenticated, mirrorFirst, pinnedRemote, tryLocal, tryRemote, notFoundMessage)
+                },
+                waiter = {
+                    if (missStats.shouldShortCircuit(repository.name, gav, authenticated)) {
+                        logger.debug("Resolution | Miss short-circuit (coalesced) for '$gav' — skipping mirrors")
+                        tryLocal().flatMapErr { notFoundError(notFoundMessage) }
+                    } else {
+                        resolveWithMirrors(repository, gav, authenticated, mirrorFirst, pinnedRemote, tryLocal, tryRemote, notFoundMessage)
+                    }
+                },
+            )
+        }
+
+        return resolveWithMirrors(repository, gav, authenticated, mirrorFirst, pinnedRemote, tryLocal, tryRemote, notFoundMessage)
+    }
+
+    private fun <T : Any> resolveWithMirrors(
+        repository: Repository,
+        gav: Location,
+        authenticated: Boolean,
+        mirrorFirst: Boolean,
+        pinnedRemote: ResolutionCache.Origin.Remote?,
+        tryLocal: () -> Result<T, ErrorResponse>,
+        tryRemote: (hosts: List<MirrorHost>) -> MirrorResolution<T>,
+        notFoundMessage: String,
+    ): Result<T, ErrorResponse> {
+        val cache = repository.resolutionCache
+        val isMetadata = gav.isResolutionMetadata()
+
+        val hosts = pinnedRemote
             ?.let { decision -> repository.mirrorHosts.filter { it.host == decision.host }.ifEmpty { repository.mirrorHosts } }
             ?: repository.mirrorHosts
 
-        val attempt = when {
-            mirrorFirst || (cached is ResolutionCache.Origin.Remote && !repository.parallelMetadataLookup) ->
+        var attempt = when {
+            mirrorFirst || (pinnedRemote != null && !repository.parallelMetadataLookup) ->
                 tryRemoteFirst(tryLocal, tryRemote, hosts, notFoundMessage)
             else -> tryLocalFirst(tryLocal, tryRemote, hosts, notFoundMessage)
         }
 
+        // Incomplete mirrors can win the pom race (e.g. gradle-plugin has .pom but not .jar).
+        // If the pinned host misses a *primary* binary, drop the pin and re-probe once.
+        // Do not do this for -javadoc/-sources: they are often unpublished and would 404-storm.
+        if (
+            cache != null &&
+            pinnedRemote != null &&
+            !attempt.result.isOk &&
+            hosts.size < repository.mirrorHosts.size &&
+            gav.shouldRetryAllMirrorsOnPinMiss()
+        ) {
+            logger.debug("Resolution | Pinned host '${pinnedRemote.host}' missed primary '$gav' — invalidating pin and retrying all mirrors")
+            cache.invalidate(gav)
+            attempt = when {
+                mirrorFirst -> tryRemoteFirst(tryLocal, tryRemote, repository.mirrorHosts, notFoundMessage)
+                else -> tryLocalFirst(tryLocal, tryRemote, repository.mirrorHosts, notFoundMessage)
+            }
+            if (attempt.result.isOk && attempt.remote is MirrorResolution.Resolved) {
+                val prefix = gav.getParent()
+                if (prefix != Location.empty()) {
+                    cache.record(prefix, authenticated, ResolutionCache.Origin.Remote(attempt.remote.mirror.host))
+                }
+            }
+            if (!attempt.result.isOk && gav.shouldTrackMissStats()) {
+                missStatsService?.recordFinalMiss(repository.name, gav, authenticated, attempt.result.error)
+            }
+            return attempt.result
+        }
+
+        if (
+            pinnedRemote != null &&
+            !attempt.result.isOk &&
+            hosts.size < repository.mirrorHosts.size &&
+            !gav.shouldRetryAllMirrorsOnPinMiss()
+        ) {
+            logger.debug("Resolution | Pinned host '${pinnedRemote.host}' missed optional '$gav' — not retrying all mirrors")
+        }
+
         if (cache != null && isMetadata) {
-            attempt.recordTo(cache, gav, authenticated, repository.parallelMetadataLookup)
+            attempt.recordTo(cache, repository.name, gav, authenticated, repository.parallelMetadataLookup)
+        }
+
+        if (!attempt.result.isOk && gav.shouldTrackMissStats()) {
+            missStatsService?.recordFinalMiss(repository.name, gav, authenticated, attempt.result.error)
         }
 
         return attempt.result
@@ -105,7 +198,13 @@ internal class ResolutionProvider(
             else -> ResolveAttempt(tryLocal().flatMapErr { remote.toResult(notFoundMessage) }, remote)
         }
 
-    private fun <T> ResolveAttempt<T>.recordTo(cache: ResolutionCache, gav: Location, authenticated: Boolean, parallelMetadataLookup: Boolean) {
+    private fun <T> ResolveAttempt<T>.recordTo(
+        cache: ResolutionCache,
+        repositoryName: String,
+        gav: Location,
+        authenticated: Boolean,
+        parallelMetadataLookup: Boolean,
+    ) {
         val prefix = gav.getParent()
         if (prefix == Location.empty()) {
             return
@@ -126,26 +225,27 @@ internal class ResolutionProvider(
             return
         }
 
-        // Parallel lookup retains the winning mirror for later misses, even when this request stored a local copy.
-        val origin = when (remote) {
-            is MirrorResolution.Resolved if parallelMetadataLookup || !remote.mirror.configuration.store ->
+        // Parallel lookup retains the winning mirror for version-scoped metadata; artifact-level metadata stays Local.
+        val origin = when {
+            remote is MirrorResolution.Resolved &&
+                gav.shouldPinRemoteOrigin() &&
+                (parallelMetadataLookup || !remote.mirror.configuration.store) ->
                 ResolutionCache.Origin.Remote(remote.mirror.host)
-            else -> ResolutionCache.Origin.Local
+            remote is MirrorResolution.Resolved &&
+                !parallelMetadataLookup &&
+                !remote.mirror.configuration.store ->
+                ResolutionCache.Origin.Remote(remote.mirror.host)
+            else ->
+                ResolutionCache.Origin.Local
         }
 
         cache.record(prefix, authenticated, origin)
-    }
 
-    private fun Location.isResolutionMetadata(): Boolean =
-        getSimpleName().let { name ->
-            when {
-                name.endsWith(".pom") -> true
-                name.endsWith(".module") -> true
-                name == METADATA_FILE -> true
-                name.endsWith(".xml") -> name == "ivy.xml" || name.startsWith("ivy-")
-                else -> false
-            }
+        // Count .pom/.module Remote pin wins for proxied-host reorder (not jar remirror pins).
+        if (origin is ResolutionCache.Origin.Remote && gav.shouldPinRemoteOrigin()) {
+            proxyHitStatsStore?.increment(repositoryName, origin.host, System.currentTimeMillis())
         }
+    }
 
     override fun getLogger(): Logger =
         journalist.logger

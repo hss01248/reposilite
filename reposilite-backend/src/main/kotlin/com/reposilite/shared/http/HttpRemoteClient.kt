@@ -134,7 +134,8 @@ class HttpRemoteClient(private val journalist: Journalist, proxy: Proxy?) : Remo
 
             when {
                 response.contentType == ContentType.HTML -> NOT_ACCEPTABLE.toErrorResult("Illegal file type (${response.contentType})")
-                response.isSuccessStatusCode.not() -> NOT_ACCEPTABLE.toErrorResult("Unsuccessful request (${response.statusCode})")
+                // Preserve real upstream status (esp. 404) so parallel mirror races can keep probing.
+                response.isSuccessStatusCode.not() -> Result.error(ErrorResponse(response.statusCode, "Unsuccessful request (${response.statusCode})"))
                 else -> consumer(response)
             }.onError {
                 response.disconnect()

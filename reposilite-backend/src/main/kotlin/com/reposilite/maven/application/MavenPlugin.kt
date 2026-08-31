@@ -21,8 +21,10 @@ import com.reposilite.configuration.shared.SharedConfigurationFacade
 import com.reposilite.console.api.CommandsSetupEvent
 import com.reposilite.frontend.application.FrontendSettings
 import com.reposilite.maven.MavenFacade
+import com.reposilite.maven.MitmRoutesAligner
 import com.reposilite.maven.PreservedBuildsListener
 import com.reposilite.maven.infrastructure.CacheCommand
+import com.reposilite.maven.infrastructure.MissStatsEndpoint
 import com.reposilite.maven.infrastructure.MavenApiEndpoints
 import com.reposilite.maven.infrastructure.MavenEndpoints
 import com.reposilite.maven.infrastructure.MavenLatestApiEndpoints
@@ -46,8 +48,7 @@ internal class MavenPlugin : ReposilitePlugin() {
     override fun initialize(): MavenFacade {
         val sharedConfigurationFacade = facade<SharedConfigurationFacade>()
 
-        val mavenFacade =
-            MavenComponents(
+        val mavenComponents = MavenComponents(
                 clock = Clock.systemDefaultZone(),
                 workingDirectory = parameters().workingDirectory,
                 journalist = this,
@@ -60,19 +61,40 @@ internal class MavenPlugin : ReposilitePlugin() {
                 statisticsFacade = facade(),
                 ioService = reposilite().ioService,
                 mavenSettings = sharedConfigurationFacade.getDomainSettings<MavenSettings>(),
-                frontendSettings = sharedConfigurationFacade.getDomainSettings<FrontendSettings>()
-            ).mavenFacade()
+                frontendSettings = sharedConfigurationFacade.getDomainSettings<FrontendSettings>(),
+                sharedConfigurationFacade = sharedConfigurationFacade,
+                database = reposilite().database,
+            )
+
+        val mavenFacade = mavenComponents.mavenFacade()
 
         logger.info("")
         logger.info("--- Repositories")
         mavenFacade.getRepositories().forEach { logger.info("+ ${it.name} (${it.visibility.toString().lowercase()})") }
         logger.info("${mavenFacade.getRepositories().size} repositories have been found")
 
+        // Align mitm rewrite table with proxied mirrors (startup check).
+        MitmRoutesAligner.alignFromSettings(
+            workingDirectory = parameters().workingDirectory,
+            settings = sharedConfigurationFacade.getDomainSettings<MavenSettings>().get(),
+            logger = logger,
+            restartMitm = true,
+        )
+        sharedConfigurationFacade.getDomainSettings<MavenSettings>().subscribe({ settings ->
+            MitmRoutesAligner.alignFromSettings(
+                workingDirectory = parameters().workingDirectory,
+                settings = settings,
+                logger = logger,
+                restartMitm = true,
+            )
+        }, false)
+
         event { event: RoutingSetupEvent ->
             val localConfiguration = facade<LocalConfiguration>()
             event.registerRoutes(MavenApiEndpoints(mavenFacade))
             event.registerRoutes(MavenEndpoints(mavenFacade, facade(), localConfiguration.compressionStrategy.get()))
             event.registerRoutes(MavenLatestApiEndpoints(mavenFacade, localConfiguration.compressionStrategy.get()))
+            mavenComponents.missStatsFacade()?.let { event.registerRoutes(MissStatsEndpoint(it)) }
         }
 
         event(PreservedBuildsListener(mavenFacade))

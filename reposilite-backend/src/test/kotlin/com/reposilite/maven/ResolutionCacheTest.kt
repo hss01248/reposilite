@@ -21,6 +21,7 @@ import com.reposilite.maven.api.METADATA_FILE
 import com.reposilite.storage.api.toLocation
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
+import java.util.concurrent.ConcurrentHashMap
 
 internal class ResolutionCacheTest {
 
@@ -225,4 +226,53 @@ internal class ResolutionCacheTest {
             .isEqualTo(Origin.Local)
     }
 
+    @Test
+    fun `remote pin is reloaded from durable store after memory miss`() {
+        val store = InMemoryResolutionOriginStore()
+        ResolutionCache(maxEntries = 4, repositoryName = "maven-public", originStore = store)
+            .record("org/example/foo/1.0".toLocation(), authenticated = false, origin = Origin.Remote("https://repo.example"))
+
+        // Fresh in-memory map, same durable store (simulates process restart).
+        val reloaded = ResolutionCache(maxEntries = 4, repositoryName = "maven-public", originStore = store)
+        assertThat(reloaded.lookup("org/example/foo/1.0/foo.pom".toLocation(), authenticated = false))
+            .isEqualTo(Origin.Remote("https://repo.example"))
+        assertThat(reloaded.size()).isEqualTo(1)
+    }
+
+    @Test
+    fun `recording local removes durable remote pin`() {
+        val store = InMemoryResolutionOriginStore()
+        val cache = ResolutionCache(maxEntries = 4, repositoryName = "maven-public", originStore = store)
+        cache.record("org/example/foo/1.0".toLocation(), authenticated = false, origin = Origin.Remote("https://repo.example"))
+        cache.record("org/example/foo/1.0".toLocation(), authenticated = false, origin = Origin.Local)
+
+        val reloaded = ResolutionCache(maxEntries = 4, repositoryName = "maven-public", originStore = store)
+        assertThat(reloaded.lookup("org/example/foo/1.0/foo.pom".toLocation(), authenticated = false)).isNull()
+    }
+
+    private class InMemoryResolutionOriginStore : ResolutionOriginStore {
+        private data class Key(val repository: String, val prefix: String, val authenticated: Boolean)
+        private val rows = ConcurrentHashMap<Key, String>()
+
+        override fun findRemote(repository: String, prefix: String, authenticated: Boolean): String? =
+            rows[Key(repository, prefix, authenticated)]
+
+        override fun upsertRemote(repository: String, prefix: String, authenticated: Boolean, host: String) {
+            rows[Key(repository, prefix, authenticated)] = host
+        }
+
+        override fun delete(repository: String, prefix: String, authenticated: Boolean) {
+            rows.remove(Key(repository, prefix, authenticated))
+        }
+
+        override fun deletePrefix(repository: String, prefix: String) {
+            rows.keys.filter { it.repository == repository && it.prefix == prefix }.forEach { rows.remove(it) }
+        }
+
+        override fun deleteRepository(repository: String) {
+            rows.keys.filter { it.repository == repository }.forEach { rows.remove(it) }
+        }
+    }
+
 }
+

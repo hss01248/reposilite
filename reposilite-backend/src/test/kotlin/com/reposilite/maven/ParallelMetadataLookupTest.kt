@@ -17,7 +17,6 @@
 package com.reposilite.maven
 
 import com.reposilite.maven.api.LookupRequest
-import com.reposilite.maven.api.METADATA_FILE
 import com.reposilite.maven.application.MirroredRepositorySettings
 import com.reposilite.maven.application.RepositorySettings
 import com.reposilite.maven.specification.MavenSpecification
@@ -30,7 +29,8 @@ import java.util.concurrent.TimeUnit.SECONDS
 
 internal class ParallelMetadataLookupTest : MavenSpecification() {
 
-    private val metadata = "com/parallel/example/$METADATA_FILE"
+    private val pom = "com/parallel/example/1.0/example-1.0.pom"
+    private val jar = "com/parallel/example/1.0/example-1.0.jar"
     private val concurrentRequests = CyclicBarrier(2)
 
     override fun repositories() = listOf(
@@ -46,18 +46,17 @@ internal class ParallelMetadataLookupTest : MavenSpecification() {
     )
 
     override fun beforeRemoteHead(uri: String) {
-        if (uri.endsWith(metadata)) {
+        if (uri.endsWith(pom)) {
             concurrentRequests.await(1, SECONDS)
         }
     }
 
     @Test
-    fun `should probe metadata concurrently and route artifacts through the winner`() {
-        assertOk(mavenFacade.findFile(LookupRequest(UNAUTHORIZED, "PARALLEL", metadata.toLocation()))).content.close()
+    fun `should probe version metadata concurrently and route artifacts through the winner`() {
+        assertOk(mavenFacade.findFile(LookupRequest(UNAUTHORIZED, "PARALLEL", pom.toLocation()))).content.close()
 
-        val artifact = "com/parallel/example/1.0/example-1.0.jar"
-        assertOk(mavenFacade.findDetails(LookupRequest(UNAUTHORIZED, "PARALLEL", artifact.toLocation())))
-        assertThat(remoteRequestsByUri["$REMOTE_REPOSITORY_WITH_WHITELIST/$artifact"]).isNull()
+        assertOk(mavenFacade.findDetails(LookupRequest(UNAUTHORIZED, "PARALLEL", jar.toLocation())))
+        assertThat(remoteRequestsByUri["$REMOTE_REPOSITORY_WITH_WHITELIST/$jar"]).isNull()
     }
 
 }

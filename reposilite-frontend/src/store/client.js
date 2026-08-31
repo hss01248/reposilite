@@ -134,6 +134,37 @@ const createClient = (defaultName, defaultSecret) => {
         return axios.delete(createURL(`/${gav}`), {
           ...defaultAuthorization(),
         })
+      },
+      missStatsList(repository, showAll = false, limit = 100, offset = 0) {
+        const query = new URLSearchParams({
+          repository,
+          showAll: String(showAll),
+          limit: String(limit),
+          offset: String(offset),
+        })
+        return get(`/api/maven/miss-stats?${query}`)
+      },
+      missStatsSettings() {
+        return get("/api/maven/miss-stats/settings")
+      },
+      missStatsUpdateSettings(body) {
+        return axios.put(createURL("/api/maven/miss-stats/settings"), body, {
+          headers: {
+            "Content-Type": "application/json",
+            ...defaultAuthorization().headers,
+          },
+        })
+      },
+      missStatsResetEntry(repository, path) {
+        const query = new URLSearchParams({ repository, path })
+        return axios.delete(createURL(`/api/maven/miss-stats/entry?${query}`), {
+          ...defaultAuthorization(),
+        })
+      },
+      missStatsClearRepository(repository) {
+        return axios.delete(createURL(`/api/maven/miss-stats/repository/${encodeURIComponent(repository)}`), {
+          ...defaultAuthorization(),
+        })
       }
     },
     settings: {

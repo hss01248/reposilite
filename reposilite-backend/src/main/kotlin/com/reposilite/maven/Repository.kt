@@ -38,7 +38,9 @@ class Repository internal constructor(
     val storagePolicy: StoragePolicy,
     val metadataMaxAgeInSeconds: Long,
     parallelMetadataLookup: Boolean,
+    metadataRaceWindowMs: Int,
     resolutionCacheMaxEntries: Int,
+    resolutionOriginStore: ResolutionOriginStore? = null,
 ) {
 
     init {
@@ -46,8 +48,17 @@ class Repository internal constructor(
     }
 
     internal val resolutionCache: ResolutionCache? =
-        if (resolutionCacheMaxEntries > 0) ResolutionCache(resolutionCacheMaxEntries) else null
+        if (resolutionCacheMaxEntries > 0) {
+            ResolutionCache(
+                maxEntries = resolutionCacheMaxEntries,
+                repositoryName = name,
+                originStore = resolutionOriginStore,
+            )
+        } else {
+            null
+        }
     internal val parallelMetadataLookup = parallelMetadataLookup && resolutionCache != null
+    internal val metadataRaceWindowMs = metadataRaceWindowMs.coerceAtLeast(0)
 
     fun acceptsDeploymentOf(location: Location): Boolean =
         redeployment || location.getSimpleName().contains(METADATA_FILE) || !storageProvider.exists(location)

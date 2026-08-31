@@ -46,6 +46,8 @@ internal class RepositoryProvider(
     resolutionProvider: ResolutionProvider,
     repositorySecurityProvider: RepositorySecurityProvider,
     repositoriesSource: Reference<List<RepositorySettings>>,
+    private val resolutionOriginStore: ResolutionOriginStore? = null,
+    private val proxyHitStatsStore: ProxyHitStatsStore? = null,
 ) {
 
     val repositoryService = RepositoryService(
@@ -77,6 +79,8 @@ internal class RepositoryProvider(
             storageFacade = storageFacade,
             repositoryService = repositoryService,
             repositoriesNames = repositoriesConfiguration.map { it.id },
+            resolutionOriginStore = resolutionOriginStore,
+            proxyHitStatsStore = proxyHitStatsStore,
         )
 
         val sharedBucketConflicts = findS3SharedBucketConflicts(

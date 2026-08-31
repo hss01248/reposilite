@@ -124,8 +124,11 @@ dependencies {
     val httpClient = "2.2.0"
     implementation("com.google.http-client:google-http-client:$httpClient") {
         exclude(group = "commons-codec", module = "commons-codec")
+        // Guava is required at runtime by google-http-client (GenericUrl → Preconditions).
+        // Keep an explicit dep so ShadowJar always packages it even if the transitive edge is excluded elsewhere.
         exclude(group = "com.google.guava", module = "guava")
     }
+    implementation("com.google.guava:guava:33.6.0-jre")
     api("commons-codec:commons-codec:1.22.1")
     testImplementation("com.google.http-client:google-http-client-jackson2:$httpClient")
 
