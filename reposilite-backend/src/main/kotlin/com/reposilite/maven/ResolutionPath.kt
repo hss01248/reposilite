@@ -111,7 +111,11 @@ internal enum class ParallelLookupMode {
 
 internal fun parallelLookupMode(repository: Repository, gav: Location): ParallelLookupMode =
     when {
-        !repository.parallelMetadataLookup || !gav.isResolutionMetadata() -> ParallelLookupMode.SERIAL
+        !repository.parallelMetadataLookup -> ParallelLookupMode.SERIAL
+        // Optional classifiers without a pin used to serial-scan every mirror (~4–7s 404).
+        // FIRST_OK keeps wall-clock near the slowest single host while still finding sources.
+        gav.isOptionalClassifierArtifact() -> ParallelLookupMode.FIRST_OK
+        !gav.isResolutionMetadata() -> ParallelLookupMode.SERIAL
         gav.isArtifactLevelMetadata() || gav.isSnapshotMetadata() -> ParallelLookupMode.PRIORITY_RACE
         else -> ParallelLookupMode.FIRST_OK
     }

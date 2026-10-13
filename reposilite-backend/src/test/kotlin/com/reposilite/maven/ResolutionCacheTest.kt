@@ -212,18 +212,18 @@ internal class ResolutionCacheTest {
     }
 
     @Test
-    fun `re-recording a different origin replaces the entry`() {
-        // given: a recorded entry with one origin
+    fun `re-recording local does not clobber an in-memory remote pin`() {
+        // given: a recorded Remote pin
         val cache = ResolutionCache(maxEntries = 4)
         cache.record("org/example/foo".toLocation(), authenticated = false, origin = Origin.Remote("h1"))
         cache.lookup("org/example/foo/1.0/foo.jar".toLocation(), authenticated = false)
 
-        // when: a different origin is recorded for the same prefix
+        // when: a Local origin is recorded for the same prefix (disk hit after restart)
         cache.record("org/example/foo".toLocation(), authenticated = false, origin = Origin.Local)
 
-        // then: subsequent lookups see the new origin
+        // then: Remote is preserved so optional classifiers can still pin to one host
         assertThat(cache.lookup("org/example/foo/1.0/foo.jar".toLocation(), authenticated = false))
-            .isEqualTo(Origin.Local)
+            .isEqualTo(Origin.Remote("h1"))
     }
 
     @Test
@@ -240,14 +240,27 @@ internal class ResolutionCacheTest {
     }
 
     @Test
-    fun `recording local removes durable remote pin`() {
+    fun `recording local preserves durable remote pin`() {
         val store = InMemoryResolutionOriginStore()
         val cache = ResolutionCache(maxEntries = 4, repositoryName = "maven-public", originStore = store)
         cache.record("org/example/foo/1.0".toLocation(), authenticated = false, origin = Origin.Remote("https://repo.example"))
         cache.record("org/example/foo/1.0".toLocation(), authenticated = false, origin = Origin.Local)
 
         val reloaded = ResolutionCache(maxEntries = 4, repositoryName = "maven-public", originStore = store)
-        assertThat(reloaded.lookup("org/example/foo/1.0/foo.pom".toLocation(), authenticated = false)).isNull()
+        assertThat(reloaded.lookup("org/example/foo/1.0/foo.pom".toLocation(), authenticated = false))
+            .isEqualTo(Origin.Remote("https://repo.example"))
+    }
+
+    @Test
+    fun `recording local warms memory from durable remote when memory was empty`() {
+        val store = InMemoryResolutionOriginStore()
+        store.upsertRemote("maven-public", "org/example/foo/1.0", authenticated = false, host = "https://repo.example")
+        val cache = ResolutionCache(maxEntries = 4, repositoryName = "maven-public", originStore = store)
+
+        cache.record("org/example/foo/1.0".toLocation(), authenticated = false, origin = Origin.Local)
+
+        assertThat(cache.lookup("org/example/foo/1.0/foo.pom".toLocation(), authenticated = false))
+            .isEqualTo(Origin.Remote("https://repo.example"))
     }
 
     private class InMemoryResolutionOriginStore : ResolutionOriginStore {

@@ -26,7 +26,8 @@ import java.util.concurrent.TimeUnit
  * Keeps mitm rewrite routes aligned with Reposilite proxied mirrors by shelling out to
  * `mitm/sync_routes.py` (single source of truth for the routes JSON).
  *
- * Layout assumption: workingDirectory is `<repo>/data`.
+ * Install root: `REPOSILITE_HOME` when set, else parent of workingDirectory (dev: `<repo>/data`).
+ * Data dir: `REPOSILITE_DATA` when set, else workingDirectory.
  */
 internal object MitmRoutesAligner {
 
@@ -63,7 +64,11 @@ internal object MitmRoutesAligner {
         restartMitm: Boolean,
         stdinRefsJson: String?,
     ) {
-        val root = workingDirectory.toAbsolutePath().normalize().parent ?: return
+        val data = System.getenv("REPOSILITE_DATA")?.takeIf { it.isNotBlank() }?.let { Path.of(it) }
+            ?: workingDirectory.toAbsolutePath().normalize()
+        val root = System.getenv("REPOSILITE_HOME")?.takeIf { it.isNotBlank() }?.let { Path.of(it) }
+            ?: workingDirectory.toAbsolutePath().normalize().parent
+            ?: return
         val script = root.resolve("mitm/sync_routes.py").toFile()
         if (!script.isFile) {
             logger.debug("Mitm routes align skipped — script not found: $script")
@@ -80,6 +85,8 @@ internal object MitmRoutesAligner {
             script.absolutePath,
             "--root",
             root.toString(),
+            "--data",
+            data.toString(),
         )
         if (!restartMitm) {
             command.add("--no-restart")
@@ -89,10 +96,12 @@ internal object MitmRoutesAligner {
         }
 
         try {
-            val process = ProcessBuilder(command)
+            val builder = ProcessBuilder(command)
                 .directory(root.toFile())
                 .redirectErrorStream(true)
-                .start()
+            builder.environment()["REPOSILITE_HOME"] = root.toString()
+            builder.environment()["REPOSILITE_DATA"] = data.toString()
+            val process = builder.start()
 
             if (stdinRefsJson != null) {
                 process.outputStream.use { out ->

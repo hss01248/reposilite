@@ -85,6 +85,23 @@ internal class ResolutionCache(
         if (entries[key]?.origin == origin) {
             return
         }
+        // Local disk hits must not erase a Remote pin. After restart, pom/aar are often
+        // served from disk and would otherwise wipe the durable host hint that optional
+        // classifiers (-sources/-javadoc) need to avoid full-mirror scans (multi-second 404s).
+        if (origin is Origin.Local) {
+            when (val existing = entries[key]?.origin) {
+                is Origin.Remote -> return
+                else -> {
+                    val storedHost = originStore?.findRemote(repositoryName, prefix.toString(), authenticated)
+                    if (storedHost != null) {
+                        if (existing == null) {
+                            putMemory(key, Origin.Remote(storedHost))
+                        }
+                        return
+                    }
+                }
+            }
+        }
         putMemory(key, origin)
         persist(prefix, authenticated, origin)
     }

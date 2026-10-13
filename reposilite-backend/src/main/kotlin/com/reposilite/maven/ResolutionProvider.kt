@@ -56,13 +56,10 @@ internal class ResolutionProvider(
 
         val pinnedRemote = cached as? ResolutionCache.Origin.Remote
 
-        // Optional classifiers (-javadoc/-sources/…) without a Remote pin: local only.
-        // No pin usually means Local disk hit for pom, or cold cache — full remirror only
-        // burns Sync time on packages that are rarely published upstream.
-        if (gav.isOptionalClassifierArtifact() && pinnedRemote == null) {
-            logger.debug("Resolution | Optional '$gav' without Remote pin — local only, skipping mirrors")
-            return tryLocal().flatMapErr { notFoundError(notFoundMessage) }
-        }
+        // Optional classifiers (-javadoc/-sources/…) still probe mirrors when there is no
+        // Remote pin (common after restart: pom/aar already on disk → Local, not Remote).
+        // Skipping mirrors here left IDE "Download Sources" permanently 404'd while upstream
+        // still had the artifact. Pin-miss full remirror stays disabled for optionals below.
 
         val missStats = missStatsService
         if (gav.shouldTrackMissStats() && missStats != null) {

@@ -179,7 +179,7 @@ internal class MirrorService(
         }
 
     private fun fetchFromRemoteHosts(repository: Repository, gav: Location, accessToken: AccessTokenIdentifier?, hosts: List<MirrorHost>): MirrorResolution<InputStream> =
-        searchInRemoteRepositories(repository, gav, accessToken, hosts) { (host, config, client) ->
+        searchInRemoteRepositories(repository, gav, accessToken, hosts, mode = parallelLookupMode(repository, gav)) { (host, config, client) ->
             client
                 .get("${host.removeSuffix("/")}/$gav", config.authorization, config.connectTimeout, config.readTimeout)
                 .flatMap { data ->
@@ -192,7 +192,7 @@ internal class MirrorService(
         }
 
     private fun fetchAndStoreFromRemoteHosts(repository: Repository, gav: Location, accessToken: AccessTokenIdentifier?, hosts: List<MirrorHost>): MirrorResolution<Unit> =
-        searchInRemoteRepositories(repository, gav, accessToken, hosts) { (host, config, client) ->
+        searchInRemoteRepositories(repository, gav, accessToken, hosts, mode = parallelLookupMode(repository, gav)) { (host, config, client) ->
             client
                 .get("${host.removeSuffix("/")}/$gav", config.authorization, config.connectTimeout, config.readTimeout)
                 .flatMap { data -> repository.storageProvider.putFile(gav, data) }
